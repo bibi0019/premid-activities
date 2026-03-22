@@ -290,6 +290,11 @@ let apiClient: ApiClient
 let presence: Presence
 let wasLogin = false
 
+// Track last known state to avoid redundant API calls
+let lastVideoTitle = ''
+let lastItemDetailsId = ''
+let lastAudioSrc = ''
+
 /**
  * Obtain the base name Url of the server
  */
@@ -326,15 +331,19 @@ function mediaPrimaryImage(mediaInfo: MediaInfo): string {
  * Handle the presence when the audio player is active
  */
 async function handleAudioPlayback(): Promise<void> {
-  const regexResult = /\/Audio\/(\w+)\/universal/.exec(
-    document.querySelector('audio')?.src ?? '',
-  )
+  const audioSrc = document.querySelector('audio')?.src ?? ''
+  const regexResult = /\/Audio\/(\w+)\/universal/.exec(audioSrc)
 
   if (!regexResult) {
     presence.error('Could not obtain audio itemId')
     return
   }
 
+  // Avoid redundant API calls if the audio source hasn't changed
+  if (audioSrc === lastAudioSrc)
+    return
+
+  lastAudioSrc = audioSrc
   await setPresenceByMediaId(regexResult[1]!)
 }
 
@@ -402,16 +411,24 @@ function getUserId(): string {
 }
 
 /**
- * Cache performed mediaInfo
+ * Cache performed mediaInfo with TTL
  */
-const mediaInfoCache = new Map<string, MediaInfo>()
+interface CacheEntry<T> {
+  data: T
+  timestamp: number
+}
+
+const CACHE_TTL = 30000 // 30 seconds TTL for cache entries
+const mediaInfoCache = new Map<string, CacheEntry<MediaInfo>>()
 
 /**
  * Obtain media info given an itemId
  */
 async function obtainMediaInfo(itemId: string): Promise<MediaInfo> {
-  if (mediaInfoCache.has(itemId))
-    return mediaInfoCache.get(itemId)!
+  // Check if cache entry exists and is still valid
+  const cached = mediaInfoCache.get(itemId)
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL)
+    return cached.data
 
   const res = await fetch(
     `${jellyfinBasenameUrl()}Users/${getUserId()}/Items/${itemId}`,
@@ -428,23 +445,28 @@ async function obtainMediaInfo(itemId: string): Promise<MediaInfo> {
   )
   const mediaInfo: MediaInfo = await res.json()
 
-  mediaInfoCache.set(itemId, mediaInfo)
+  mediaInfoCache.set(itemId, {
+    data: mediaInfo,
+    timestamp: Date.now(),
+  })
 
-  return mediaInfoCache.get(itemId)!
+  return mediaInfo
 }
 
 /**
  * Cache performed media searches
  */
-const searchMediaCache = new Map<string, MediaInfo[]>()
+const searchMediaCache = new Map<string, CacheEntry<MediaInfo[]>>()
 const uploadedMediaCache = new Map<string, string>()
 
 /**
  * Search Movie and Series given a term
  */
 async function searchMedia(searchTerm: string): Promise<MediaInfo[]> {
-  if (searchMediaCache.has(searchTerm))
-    return searchMediaCache.get(searchTerm)!
+  // Check if cache entry exists and is still valid
+  const cached = searchMediaCache.get(searchTerm)
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL)
+    return cached.data
 
   if (/- S\d+:E\d+ -/.test(searchTerm))
     searchTerm = searchTerm.split(' - ').pop() ?? ''
@@ -471,9 +493,12 @@ async function searchMedia(searchTerm: string): Promise<MediaInfo[]> {
   )
   const resJson = await res.json()
 
-  searchMediaCache.set(searchTerm, resJson.Items)
+  searchMediaCache.set(searchTerm, {
+    data: resJson.Items,
+    timestamp: Date.now(),
+  })
 
-  return searchMediaCache.get(searchTerm)!
+  return resJson.Items
 }
 
 /**
@@ -486,11 +511,16 @@ async function handleVideoPlayback(): Promise<void> {
   }
 
   // title on the header
-  const [mediaInfo] = await searchMedia(
-    document.querySelector<HTMLHeadingElement>('h3.pageTitle')?.textContent ?? '',
-  )
+  const videoTitle = document.querySelector<HTMLHeadingElement>('h3.pageTitle')?.textContent ?? ''
+
+  // Avoid redundant API calls if the video title hasn't changed
+  if (videoTitle && videoTitle === lastVideoTitle)
+    return
+
+  const [mediaInfo] = await searchMedia(videoTitle)
 
   if (mediaInfo) {
+    lastVideoTitle = videoTitle
     await setPresenceByMediaId(mediaInfo.Id)
     return
   }
@@ -518,9 +548,14 @@ async function handleRemotePlayback(): Promise<void> {
  * Handle the presence when the user is viewing the details of an item
  */
 async function handleItemDetails(): Promise<void> {
-  const data = await obtainMediaInfo(
-    new URLSearchParams(location.hash.split('?')[1]).get('id')!,
-  )
+  const itemId = new URLSearchParams(location.hash.split('?')[1]).get('id')!
+
+  // Avoid redundant API calls if the item ID hasn't changed
+  if (itemId === lastItemDetailsId)
+    return
+
+  lastItemDetailsId = itemId
+  const data = await obtainMediaInfo(itemId)
 
   if (!data) {
     presenceData.details = 'Browsing details of an item'
@@ -818,6 +853,15 @@ async function setDefaultsToPresence(): Promise<void> {
 
   if ((await presence.getSetting<boolean>('showTimestamps')) === false)
     delete presenceData.startTimestamp
+
+  // Reset tracking variables when context changes
+  const path = location.hash.split('?')[0]?.substring(2)
+  if (path !== 'video')
+    lastVideoTitle = ''
+  if (path !== 'details')
+    lastItemDetailsId = ''
+  if (!document.querySelector('audio')?.src)
+    lastAudioSrc = ''
 }
 
 /**
@@ -876,7 +920,8 @@ async function updateData(): Promise<void> {
         presenceData.largeImageKey = uploadedMediaCache.get(largeImageKey)
       }
       else {
-        await fetch(largeImageKey)
+        // Fetch image asynchronously without blocking, cache for future use
+        fetch(largeImageKey)
           .then(res => res.blob())
           .then((blob) => {
             const reader = new FileReader()
@@ -884,9 +929,15 @@ async function updateData(): Promise<void> {
             reader.onloadend = () => {
               const result = reader.result as string
               uploadedMediaCache.set(largeImageKey, result)
-              presenceData.largeImageKey = result
+              // Don't update presenceData.largeImageKey here as the presence has already been set
+              // The cached image will be used on the next update cycle
             }
           })
+          .catch(() => {
+            // Silently ignore image fetch errors, fallback to default logo
+          })
+        // Use default logo while image is loading
+        presenceData.largeImageKey = ActivityAssets.logo
       }
     }
 
